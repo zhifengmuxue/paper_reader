@@ -513,8 +513,30 @@ textarea {
 .markdown-body ul,
 .markdown-body ol,
 .markdown-body pre,
-.markdown-body blockquote {
+.markdown-body blockquote,
+.markdown-body table {
   margin: 0 0 1rem;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4 {
+  margin: 1.35rem 0 0.75rem;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+}
+
+.markdown-body h1 {
+  font-size: 1.45rem;
+}
+
+.markdown-body h2 {
+  font-size: 1.25rem;
+}
+
+.markdown-body h3 {
+  font-size: 1.08rem;
 }
 
 .markdown-body ul,
@@ -522,22 +544,76 @@ textarea {
   padding-left: 1.4rem;
 }
 
+.markdown-body a {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-decoration-color: rgba(111, 54, 24, 0.35);
+  text-underline-offset: 0.16em;
+}
+
 .markdown-body li + li {
   margin-top: 0.25rem;
 }
 
 .markdown-body code {
-  padding: 0.14rem 0.34rem;
+  padding: 0.16rem 0.42rem;
   border-radius: 8px;
-  background: rgba(143, 78, 43, 0.08);
-  font-size: 0.92em;
+  background: rgba(111, 54, 24, 0.08);
+  border: 1px solid rgba(111, 54, 24, 0.08);
+  font-size: 0.9em;
+  font-family: "SFMono-Regular", "SF Mono", "Menlo", "Consolas", monospace;
+}
+
+.markdown-body pre {
+  overflow: auto;
+  border-radius: 16px;
+  border: 1px solid rgba(47, 36, 23, 0.08);
+  background: linear-gradient(180deg, rgba(53, 43, 31, 0.98), rgba(34, 28, 20, 0.98));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 .markdown-body pre code {
   display: block;
-  padding: 1rem;
-  overflow: auto;
-  background: rgba(47, 36, 23, 0.05);
+  padding: 1rem 1.05rem;
+  overflow: visible;
+  background: transparent;
+  border: 0;
+  color: #f8f1e7;
+  line-height: 1.6;
+}
+
+.markdown-body blockquote {
+  padding: 0.85rem 1rem;
+  border-left: 4px solid rgba(143, 78, 43, 0.45);
+  border-radius: 0 14px 14px 0;
+  background: rgba(143, 78, 43, 0.06);
+  color: var(--text-muted);
+}
+
+.markdown-body table {
+  width: 100%;
+  border-collapse: collapse;
+  overflow: hidden;
+  border-radius: 14px;
+  border: 1px solid rgba(92, 70, 41, 0.12);
+  background: rgba(255, 252, 247, 0.92);
+}
+
+.markdown-body th,
+.markdown-body td {
+  padding: 0.7rem 0.8rem;
+  border-bottom: 1px solid rgba(92, 70, 41, 0.08);
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown-body th {
+  background: rgba(143, 78, 43, 0.08);
+  font-weight: 700;
+}
+
+.markdown-body tr:last-child td {
+  border-bottom: 0;
 }
 
 .markdown-body .katex-display {
@@ -645,12 +721,42 @@ textarea {
   overflow: auto;
   padding: 1.4rem 1.5rem;
   border-radius: 22px;
-  background: rgba(255, 255, 252, 0.94);
+  background: rgba(255, 255, 252, 0.97);
   border: 1px solid rgba(92, 70, 41, 0.1);
   box-shadow: 0 18px 36px rgba(66, 42, 18, 0.1);
-  white-space: pre-wrap;
-  word-break: break-word;
-  line-height: 1.7;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.75;
+  backdrop-filter: blur(6px);
+}
+
+.translation-text-block.markdown-body {
+  font-size: 1rem;
+}
+
+.translation-text-block.markdown-body p,
+.translation-text-block.markdown-body ul,
+.translation-text-block.markdown-body ol,
+.translation-text-block.markdown-body blockquote,
+.translation-text-block.markdown-body table {
+  line-height: 1.78;
+}
+
+.translation-text-block.markdown-body h1,
+.translation-text-block.markdown-body h2,
+.translation-text-block.markdown-body h3 {
+  color: #2a1e12;
+}
+
+.translation-text-block.markdown-body pre {
+  margin-top: 0.85rem;
+}
+
+.translation-text-block.markdown-body .katex-display {
+  margin: 0.85rem 0 1rem;
+  padding: 0.6rem 0.2rem;
+  background: rgba(143, 78, 43, 0.04);
+  border-radius: 14px;
 }
 
 .translation-card {
@@ -808,7 +914,7 @@ textarea {
 }
 
 .chat-message {
-  padding: 0.95rem;
+  padding: 1rem 1.05rem;
 }
 
 .chat-message.user {
@@ -817,6 +923,20 @@ textarea {
 
 .chat-message.assistant {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(248, 244, 238, 0.86));
+  border-color: rgba(143, 78, 43, 0.12);
+}
+
+.chat-message.assistant .markdown-body {
+  font-size: 0.98rem;
+  line-height: 1.72;
+}
+
+.chat-message.assistant .markdown-body pre {
+  margin-top: 0.8rem;
+}
+
+.chat-message.assistant .markdown-body code {
+  word-break: break-word;
 }
 
 .chat-composer {

@@ -392,7 +392,7 @@ export function App() {
       setConfig(saved);
       setDraftConfig(saved);
       setShowSettings(false);
-      setStatusText("设置已保存");
+      setStatusText("已从 .env 重新加载配置，修改 .env 后需重启应用");
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to save settings.");
     }
@@ -578,7 +578,7 @@ export function App() {
           <div className="panel-title-row">
             <h2>API 设置</h2>
             <button className="secondary" onClick={saveSettings}>
-              保存
+              从 .env 刷新
             </button>
           </div>
           <div className="settings-grid">
@@ -649,7 +649,7 @@ export function App() {
               />
             </label>
           </div>
-          <p className="muted">支持 OpenAI 兼容 `chat/completions` 接口。译文会按 Markdown 和 LaTeX 数学公式格式显示。</p>
+          <p className="muted">当前配置完全来自项目根目录的 `.env`。此面板仅用于查看当前值；修改 `.env` 后请重启应用，再点击按钮重新加载显示。</p>
         </section>
       ) : null}
 
@@ -837,7 +837,11 @@ export function App() {
                   chatMessages.map((message, index) => (
                     <article key={`${message.role}-${index}`} className={`chat-message ${message.role}`}>
                       <header>{message.role === "user" ? "你" : "助手"}</header>
-                      <p>{message.content}</p>
+                      {message.role === "assistant" ? (
+                        <div className="markdown-body">{renderChatMessage(message.content)}</div>
+                      ) : (
+                        <p>{message.content}</p>
+                      )}
                     </article>
                   ))
                 )}
@@ -904,8 +908,14 @@ function renderOriginalContent(text: string) {
   return text.trim() ? text : "这一页没有提取到原文文本。";
 }
 
+function normalizeLatexMarkdown(content: string) {
+  return content
+    .replace(/\\\[((?:.|\n)*?)\\\]/g, (_, expression: string) => `\n\n$$\n${expression.trim()}\n$$\n\n`)
+    .replace(/\\\(((?:.|\n)*?)\\\)/g, (_match, expression: string) => `$${expression.trim()}$`);
+}
+
 function renderTranslationBlock(page: TranslationPage | null) {
-  const content = renderTranslationContent(page);
+  const content = normalizeLatexMarkdown(renderTranslationContent(page));
   return (
     <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
       {content}
@@ -930,6 +940,14 @@ function renderTranslationContent(page: TranslationPage | null) {
     return "这一页还没有翻译。";
   }
   return "正在翻译当前页。";
+}
+
+function renderChatMessage(content: string) {
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
+      {normalizeLatexMarkdown(content)}
+    </ReactMarkdown>
+  );
 }
 
 function getPageStatusText(page: TranslationPage | null) {

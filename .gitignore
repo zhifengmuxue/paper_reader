@@ -4,3 +4,6 @@ dist-renderer
 release
 .DS_Store
 .env
+
+package-lock.json
+demo

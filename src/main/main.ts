@@ -31,15 +31,15 @@ import type {
   TranslationResult
 } from "../shared/types.js";
 
-dotenv.config();
+dotenv.config({ override: true });
 
 const execFileAsync = promisify(execFile);
 const APP_NAME = "Paper Reader Studio";
+const DEBUG_ENV_PATH = ".dbg/chat-fetch-failed.env";
 
 let mainWindow: BrowserWindow | null = null;
 
 const CONFIG_DIR_NAME = "paper-reader";
-const CONFIG_FILE_NAME = "config.json";
 const TRANSLATION_CACHE_VERSION = 1;
 
 interface OcrHelperResult {
@@ -109,7 +109,6 @@ const ensureDirectory = (directoryPath: string): string => {
 const getStateDirectory = (): string =>
   ensureDirectory(join(app.getPath("userData"), CONFIG_DIR_NAME));
 
-const getConfigPath = (): string => join(getStateDirectory(), CONFIG_FILE_NAME);
 const getBundledSkillsDir = (): string => join(app.getAppPath(), "skills");
 const getUserSkillsDir = (): string => ensureDirectory(join(getStateDirectory(), "skills"));
 const getTranslationCacheDir = (): string =>
@@ -120,32 +119,9 @@ const getOcrHelperPath = (): string =>
     ? join(process.resourcesPath, "bin", "ocr-helper")
     : join(app.getAppPath(), "bin", "ocr-helper");
 
-const readConfig = (): AppConfig => {
-  const configPath = getConfigPath();
-  if (!existsSync(configPath)) {
-    writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2), "utf-8");
-    return defaultConfig;
-  }
+const readConfig = (): AppConfig => ({ ...defaultConfig });
 
-  try {
-    const parsed = JSON.parse(readFileSync(configPath, "utf-8")) as Partial<AppConfig>;
-    return {
-      ...defaultConfig,
-      ...parsed
-    };
-  } catch {
-    return defaultConfig;
-  }
-};
-
-const saveConfig = (config: AppConfig): AppConfig => {
-  const merged = {
-    ...defaultConfig,
-    ...config
-  };
-  writeFileSync(getConfigPath(), JSON.stringify(merged, null, 2), "utf-8");
-  return merged;
-};
+const saveConfig = (_config: AppConfig): AppConfig => readConfig();
 
 const sha256 = (value: Uint8Array | string): string => createHash("sha256").update(value).digest("hex");
 
@@ -414,6 +390,40 @@ const buildChatPayload = (
   messages
 });
 
+const reportDebugEvent = (
+  hypothesisId: "A" | "B" | "C" | "D",
+  location: string,
+  msg: string,
+  data: Record<string, unknown>
+): void => {
+  let debugServerUrl = "http://127.0.0.1:7777/event";
+  let sessionId = "chat-fetch-failed";
+
+  try {
+    const envText = readFileSync(DEBUG_ENV_PATH, "utf-8");
+    debugServerUrl = envText.match(/DEBUG_SERVER_URL=(.+)/)?.[1]?.trim() ?? debugServerUrl;
+    sessionId = envText.match(/DEBUG_SESSION_ID=(.+)/)?.[1]?.trim() ?? sessionId;
+  } catch {
+    // Ignore missing debug configuration and keep the default localhost target.
+  }
+
+  void fetch(debugServerUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      sessionId,
+      runId: "pre-fix",
+      hypothesisId,
+      location,
+      msg,
+      data,
+      ts: Date.now()
+    })
+  }).catch(() => {});
+};
+
 const requestChatCompletion = async (
   config: AppConfig,
   messages: ChatMessage[],
@@ -423,19 +433,63 @@ const requestChatCompletion = async (
     throw new Error("Missing API key. Please set API Settings first.");
   }
 
-  const response = await fetch(`${config.apiBaseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.apiKey}`
-    },
-    body: JSON.stringify(buildChatPayload(messages, model, config.temperature))
+  const requestUrl = `${config.apiBaseUrl.replace(/\/$/, "")}/chat/completions`;
+
+  // #region debug-point A:request-chat-start
+  reportDebugEvent("A", "src/main/main.ts:requestChatCompletion:start", "[DEBUG] Starting chat completion request", {
+    requestUrl,
+    model,
+    hasApiKey: Boolean(config.apiKey.trim()),
+    apiBaseUrl: config.apiBaseUrl
   });
+  // #endregion
+
+  let response: Response;
+  try {
+    response = await fetch(requestUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`
+      },
+      body: JSON.stringify(buildChatPayload(messages, model, config.temperature))
+    });
+  } catch (error) {
+    // #region debug-point B:request-chat-fetch-error
+    reportDebugEvent("B", "src/main/main.ts:requestChatCompletion:fetch", "[DEBUG] Chat completion fetch threw before receiving a response", {
+      requestUrl,
+      apiBaseUrl: config.apiBaseUrl,
+      model,
+      errorName: error instanceof Error ? error.name : typeof error,
+      errorMessage: error instanceof Error ? error.message : String(error),
+      errorStack: error instanceof Error ? error.stack ?? "" : "",
+      errorCause:
+        error instanceof Error && "cause" in error
+          ? String((error as Error & { cause?: unknown }).cause ?? "")
+          : ""
+    });
+    // #endregion
+    throw error;
+  }
 
   if (!response.ok) {
     const errorText = await response.text();
+    // #region debug-point D:request-chat-non-ok
+    reportDebugEvent("D", "src/main/main.ts:requestChatCompletion:non-ok", "[DEBUG] Chat completion returned a non-OK response", {
+      requestUrl,
+      status: response.status,
+      responseText: errorText.slice(0, 1000)
+    });
+    // #endregion
     throw new Error(`Model request failed: ${response.status} ${errorText}`);
   }
+
+  // #region debug-point C:request-chat-success
+  reportDebugEvent("C", "src/main/main.ts:requestChatCompletion:success", "[DEBUG] Chat completion HTTP request succeeded", {
+    requestUrl,
+    status: response.status
+  });
+  // #endregion
 
   const data = (await response.json()) as {
     choices?: Array<{ message?: { content?: string | Array<{ type: string; text?: string }> } }>;
@@ -566,14 +620,16 @@ const translateDocument = async (
           {
             role: "system",
             content:
-              "You are a professional academic translator. Preserve equations, symbols, citations, section numbering, and technical terms. Keep inline math and display math in valid LaTeX form using $...$ and $$...$$. Some paragraphs may continue across page breaks. Use the provided previous-page and next-page context only to resolve continuity, but return only the translation of the current page."
+              "You are a professional academic translator and document normalizer. Translate the current page into polished academic prose while structuring the result as clean Markdown that renders well in a reader UI. Preserve equations, symbols, citations, section numbering, technical terms, model names, and references. Keep inline math and display math in valid LaTeX using $...$ and $$...$$. If the source clearly contains headings, bullet points, enumerations, or tabular comparisons, preserve that structure using Markdown headings, lists, and tables. Do not invent new sections or tables when the source does not imply them. Some paragraphs may continue across page breaks. Use the provided previous-page and next-page context only to resolve continuity, but return only the translation of the current page."
           },
           {
             role: "user",
             content: [
-              `Translate the current academic paper page into ${config.targetLanguage}. Preserve paragraph structure as much as possible.`,
+              `Translate the current academic paper page into ${config.targetLanguage}. Preserve paragraph structure as much as possible and format the result as readable Markdown.`,
               "If a paragraph starts on the previous page or continues to the next page, use the context to keep the translation coherent.",
-              "Return only the translated text for the current page. Do not include explanations, notes, or headings.",
+              "Preserve formulas in LaTeX, using inline math for short expressions and display math for standalone equations.",
+              "If the page contains comparison data, metric rows, or obvious columnar content, rewrite it as a Markdown table.",
+              "Return only the translated page content. Do not include explanations, translator notes, or fenced code blocks unless the source itself is code.",
               previousContext ? `\nPrevious page tail context:\n${previousContext}` : "",
               `\nCurrent page text:\n${page.originalText}`,
               nextContext ? `\nNext page head context:\n${nextContext}` : ""
