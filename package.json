@@ -1,0 +1,101 @@
+{
+  "name": "paper-reader",
+  "version": "0.1.0",
+  "description": "A native-feeling Apple Silicon paper reading app with OCR, full-text translation, chat copilot, and local skill extensions.",
+  "author": "dianyou",
+  "private": true,
+  "type": "module",
+  "homepage": "https://paper-reader.local",
+  "keywords": [
+    "paper-reader",
+    "pdf",
+    "ocr",
+    "translation",
+    "research"
+  ],
+  "main": "dist-electron/main/main.js",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:main\" \"npm:dev:electron\"",
+    "dev:renderer": "vite",
+    "dev:main": "tsc -p tsconfig.main.json --watch --preserveWatchOutput",
+    "dev:electron": "wait-on tcp:5173 file:dist-electron/main/main.js file:src/main/preload.cjs && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
+    "build:assets": "python3 scripts/generate_brand_assets.py",
+    "build:ocr-helper": "mkdir -p bin && swiftc native/ocr_helper.swift -O -o bin/ocr-helper",
+    "build": "npm run build:assets && npm run build:ocr-helper && tsc -p tsconfig.main.json && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.main.json --noEmit",
+    "dist:mac": "npm run build && electron-builder --mac --arm64"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "katex": "^0.17.0",
+    "pdfjs-dist": "^4.4.168",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-markdown": "^10.1.0",
+    "rehype-katex": "^7.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.dianyou.paperreader",
+    "productName": "Paper Reader Studio",
+    "asar": true,
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist-renderer/**/*",
+      "dist-electron/**/*",
+      "src/main/preload.cjs",
+      "bin/**/*",
+      "skills/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "bin",
+        "to": "bin"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "build/icon.icns",
+      "extendInfo": {
+        "CFBundleDisplayName": "Paper Reader Studio",
+        "CFBundleName": "Paper Reader Studio",
+        "CFBundleGetInfoString": "Paper Reader Studio helps you read, OCR, translate, and discuss academic PDFs.",
+        "NSHumanReadableCopyright": "Copyright 2026 dianyou. All rights reserved."
+      },
+      "artifactName": "${productName}-${arch}.${ext}",
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ]
+    }
+  }
+}
