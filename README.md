@@ -1,5 +1,5 @@
 # Paper Reader
-
+# (完全使用 codex 生成)
 一个面向 Apple Silicon 的桌面论文阅读器，支持：
 
 - 本地打开 PDF
