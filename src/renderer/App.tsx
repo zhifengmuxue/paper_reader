@@ -11,6 +11,8 @@ import type {
   AppConfig,
   ChatMessage,
   LoadedDocument,
+  OcrProvider,
+  PdfParseProgress,
   SkillManifest,
   TranslationCacheInfo,
   TranslationPage,
@@ -23,6 +25,12 @@ type BusyState = "idle" | "loading-pdf" | "translating" | "chatting";
 type PaneId = "original" | "translation" | "chat";
 type TranslationView = "all" | "page";
 
+interface PreviewDocumentInfo {
+  filePath: string;
+  fileName: string;
+  pageCount: number;
+}
+
 const defaultConfig: AppConfig = {
   apiBaseUrl: "https://api.openai.com/v1",
   apiKey: "",
@@ -31,6 +39,7 @@ const defaultConfig: AppConfig = {
   temperature: 0.2,
   targetLanguage: "中文",
   useOcrFallback: true,
+  ocrProvider: "native",
   ocrLanguageHint: "en-US,zh-Hans,ja-JP"
 };
 
@@ -45,6 +54,8 @@ export function App() {
   const [busyState, setBusyState] = useState<BusyState>("idle");
   const [statusText, setStatusText] = useState("就绪");
   const [documentData, setDocumentData] = useState<LoadedDocument | null>(null);
+  const [previewDocument, setPreviewDocument] = useState<PreviewDocumentInfo | null>(null);
+  const [parseProgress, setParseProgress] = useState<PdfParseProgress | null>(null);
   const [translation, setTranslation] = useState<TranslationResult | null>(null);
   const [translationProgress, setTranslationProgress] = useState<TranslationProgress | null>(null);
   const [translationCacheInfo, setTranslationCacheInfo] = useState<TranslationCacheInfo | null>(null);
@@ -71,7 +82,19 @@ export function App() {
   const originalCompareCardRefs = useRef<Record<number, HTMLElement | null>>({});
   const translationCompareCardRefs = useRef<Record<number, HTMLElement | null>>({});
   const compareScrollSyncLockRef = useRef(false);
+  const previewRenderTokenRef = useRef(0);
+  const loadingPdfPathRef = useRef<string | null>(null);
   const api = typeof window !== "undefined" ? window.paperReaderApi : undefined;
+
+  const describeConfiguredOcr = (currentConfig: AppConfig): string => {
+    if (!currentConfig.useOcrFallback || currentConfig.ocrProvider === "none") {
+      return "当前已关闭 OCR 补全";
+    }
+    if (currentConfig.ocrProvider === "mineru") {
+      return "当前使用 MinerU 作为 OCR 模块";
+    }
+    return "当前使用原生 OCR 补全稀疏页面";
+  };
 
   useEffect(() => {
     if (!api) {
@@ -82,14 +105,26 @@ export function App() {
       return;
     }
     void initialize();
+    const unsubscribePdfParse = api.onPdfParseProgress((progress) => {
+      if (loadingPdfPathRef.current && progress.filePath !== loadingPdfPathRef.current) {
+        return;
+      }
+      setParseProgress(progress);
+      setStatusText(progress.status);
+    });
     const unsubscribe = api.onTranslationProgress((progress) => {
       setTranslationProgress(progress);
       setStatusText(progress.status);
     });
     return () => {
+      unsubscribePdfParse();
       unsubscribe();
     };
   }, [api]);
+
+  const currentFilePath = documentData?.filePath ?? previewDocument?.filePath ?? null;
+  const currentFileName = documentData?.fileName ?? previewDocument?.fileName ?? null;
+  const currentPageCount = documentData?.pageCount ?? previewDocument?.pageCount ?? 0;
 
   useEffect(() => {
     return () => {
@@ -100,14 +135,14 @@ export function App() {
   }, [pdfUrl]);
 
   const pageOptions = useMemo(() => {
-    if (!documentData) {
+    if (currentPageCount === 0) {
       return [];
     }
-    return documentData.pages.map((page) => ({
-      value: page.pageNumber,
-      label: `第 ${page.pageNumber} 页`
+    return Array.from({ length: currentPageCount }, (_, index) => ({
+      value: index + 1,
+      label: `第 ${index + 1} 页`
     }));
-  }, [documentData]);
+  }, [currentPageCount]);
 
   const currentTranslatedPage = useMemo(
     () => translation?.pages.find((page) => page.pageNumber === activePage) ?? null,
@@ -242,10 +277,12 @@ export function App() {
     }
   };
 
-  const loadPdfPreview = async (filePath: string, preferredPage?: number) => {
+  const loadPdfPreview = async (filePath: string, preferredPage?: number): Promise<PreviewDocumentInfo> => {
     if (!api) {
       throw new Error("Desktop bridge unavailable.");
     }
+    const renderToken = previewRenderTokenRef.current + 1;
+    previewRenderTokenRef.current = renderToken;
     const data = await api.loadPdfBinary(filePath);
     const normalized = new Uint8Array(data.byteLength);
     normalized.set(data);
@@ -257,30 +294,47 @@ export function App() {
       }
       return nextUrl;
     });
+    setPdfThumbs({});
+    setActivePdfImage("");
 
     const pdf = await pdfjs.getDocument({ data }).promise;
-    const thumbs: Record<number, string> = {};
-    const previewCount = Math.min(pdf.numPages, 18);
-
-    for (let index = 1; index <= previewCount; index += 1) {
-      const page = await pdf.getPage(index);
-      const viewport = page.getViewport({ scale: 0.3 });
-      const canvas = document.createElement("canvas");
-      const context = canvas.getContext("2d");
-      if (!context) {
-        continue;
-      }
-      canvas.width = Math.ceil(viewport.width);
-      canvas.height = Math.ceil(viewport.height);
-      await page.render({ canvasContext: context, viewport }).promise;
-      thumbs[index] = canvas.toDataURL("image/png");
-    }
-
-    setPdfThumbs(thumbs);
-
     const targetPage = preferredPage ?? activePage ?? 1;
     const image = await renderPdfPageImage(pdf, targetPage);
-    setActivePdfImage(image);
+    if (previewRenderTokenRef.current === renderToken) {
+      setActivePdfImage(image);
+    }
+
+    const previewCount = Math.min(pdf.numPages, 18);
+    void (async () => {
+      for (let index = 1; index <= previewCount; index += 1) {
+        const page = await pdf.getPage(index);
+        const viewport = page.getViewport({ scale: 0.3 });
+        const canvas = document.createElement("canvas");
+        const context = canvas.getContext("2d");
+        if (!context) {
+          continue;
+        }
+        canvas.width = Math.ceil(viewport.width);
+        canvas.height = Math.ceil(viewport.height);
+        await page.render({ canvasContext: context, viewport }).promise;
+        const thumbnail = canvas.toDataURL("image/png");
+        if (previewRenderTokenRef.current !== renderToken) {
+          return;
+        }
+        setPdfThumbs((previous) => ({
+          ...previous,
+          [index]: thumbnail
+        }));
+      }
+    })();
+
+    const nextPreviewDocument = {
+      filePath,
+      fileName: getFileNameFromPath(filePath),
+      pageCount: pdf.numPages
+    };
+    setPreviewDocument(nextPreviewDocument);
+    return nextPreviewDocument;
   };
 
   const renderActivePdfPage = async (filePath: string, pageNumber: number) => {
@@ -304,28 +358,49 @@ export function App() {
       return;
     }
 
+    loadingPdfPathRef.current = filePath;
     setBusyState("loading-pdf");
-    setStatusText("正在载入 PDF");
+    setStatusText("正在准备 PDF 预览");
+    setDocumentData(null);
+    setPreviewDocument(null);
+    setParseProgress(null);
+    setTranslation(null);
+    setTranslationCacheInfo(null);
+    setTranslationProgress(null);
+    setForceRetranslate(false);
+    setChatMessages([]);
+    let previewReady = false;
     try {
+      await loadPdfPreview(filePath, 1);
+      previewReady = true;
+      const firstPage = 1;
+      setActivePage(firstPage);
+      setJumpPage(String(firstPage));
+      setTranslationView("page");
+      setStatusText("PDF 预览已就绪，后台正在解析文档");
+
       const loaded = await api.loadPdf(filePath);
-      const firstPage = loaded.pages[0]?.pageNumber ?? 1;
-      await loadPdfPreview(filePath, firstPage);
       const cacheInfo = await api.getTranslationCacheInfo(loaded);
       const cachedTranslation = await api.loadCachedTranslation(loaded);
       setDocumentData(loaded);
+      setPreviewDocument({
+        filePath: loaded.filePath,
+        fileName: loaded.fileName,
+        pageCount: loaded.pageCount
+      });
       setTranslation(cachedTranslation);
       setTranslationCacheInfo(cacheInfo);
       setTranslationProgress(null);
-      setActivePage(firstPage);
-      setJumpPage(String(firstPage));
+      setParseProgress(null);
+      setActivePage(loaded.pages[0]?.pageNumber ?? firstPage);
+      setJumpPage(String(loaded.pages[0]?.pageNumber ?? firstPage));
       setTranslationView(cachedTranslation ? "all" : "page");
-      setForceRetranslate(false);
-      setChatMessages([]);
       setStatusText(cachedTranslation ? `已载入 ${loaded.fileName}，并恢复翻译缓存` : `已载入 ${loaded.fileName}`);
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to load PDF.");
-      setStatusText("PDF 载入失败");
+      setStatusText(previewReady ? "PDF 预览已就绪，但后台解析失败" : "PDF 载入失败");
     } finally {
+      loadingPdfPathRef.current = null;
       setBusyState("idle");
     }
   };
@@ -447,36 +522,33 @@ export function App() {
   const goToPage = (pageNumber: number) => {
     setActivePage(pageNumber);
     setJumpPage(String(pageNumber));
-    if (documentData) {
-      void renderActivePdfPage(documentData.filePath, pageNumber);
+    if (currentFilePath) {
+      void renderActivePdfPage(currentFilePath, pageNumber);
     }
   };
 
   const submitJumpPage = () => {
     const parsed = Number(jumpPage);
-    if (!Number.isInteger(parsed) || !documentData) {
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > currentPageCount) {
       return;
     }
-    const page = documentData.pages.find((item) => item.pageNumber === parsed);
-    if (page) {
-      goToPage(page.pageNumber);
-      if (translationView === "page") {
-        originalPaneRef.current?.scrollTo({ top: 0, behavior: "smooth" });
-      } else {
-        originalCompareCardRefs.current[page.pageNumber]?.scrollIntoView({
-          block: "start",
-          behavior: "smooth"
-        });
-        translationCompareCardRefs.current[page.pageNumber]?.scrollIntoView({
-          block: "start",
-          behavior: "smooth"
-        });
-      }
+    goToPage(parsed);
+    if (translationView === "page" || !documentData) {
+      originalPaneRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+    } else {
+      originalCompareCardRefs.current[parsed]?.scrollIntoView({
+        block: "start",
+        behavior: "smooth"
+      });
+      translationCompareCardRefs.current[parsed]?.scrollIntoView({
+        block: "start",
+        behavior: "smooth"
+      });
     }
   };
 
   const goToPreviousPage = () => {
-    if (!documentData || activePage === null) {
+    if (currentPageCount === 0 || activePage === null) {
       return;
     }
     const nextPage = Math.max(1, activePage - 1);
@@ -484,10 +556,10 @@ export function App() {
   };
 
   const goToNextPage = () => {
-    if (!documentData || activePage === null) {
+    if (currentPageCount === 0 || activePage === null) {
       return;
     }
-    const nextPage = Math.min(documentData.pageCount, activePage + 1);
+    const nextPage = Math.min(currentPageCount, activePage + 1);
     goToPage(nextPage);
   };
 
@@ -551,24 +623,38 @@ export function App() {
 
       <section className="statusbar">
         <span>{statusText}</span>
-        {documentData ? <span>{documentData.fileName}</span> : <span>还没有载入 PDF</span>}
+        {currentFileName ? <span>{currentFileName}</span> : <span>还没有载入 PDF</span>}
         {translationProgress ? (
           <span>
             翻译进度 {translationProgress.completedPages}/{translationProgress.totalPages}
           </span>
+        ) : parseProgress ? (
+          <span>解析进度 {parseProgress.percent}%</span>
         ) : (
           <span>{translationCacheInfo?.hasCache ? `缓存 ${translationCacheInfo.completedPages}/${translationCacheInfo.totalPages}` : "当前没有翻译任务"}</span>
         )}
       </section>
 
-      {documentData ? (
+      {documentData || previewDocument ? (
         <section className="statusbar document-meta">
-          <span>{documentData.usedOcr ? "已启用 OCR 补全稀疏页面" : "当前使用 PDF 内嵌文本"}</span>
-          <span>页数：{documentData.pageCount}</span>
           <span>
-            {translationCacheInfo?.hasCache
-              ? `缓存时间：${translationCacheInfo.translatedAt ?? "未知"}`
-              : "尚未生成翻译缓存"}
+            {documentData
+              ? documentData.parserProvider === "mineru"
+                ? "当前使用 MinerU 结构化解析"
+                : documentData.usedOcr
+                  ? describeConfiguredOcr(config)
+                  : config.useOcrFallback && config.ocrProvider !== "none"
+                    ? `当前使用 PDF 内嵌文本，必要时回退到${config.ocrProvider === "mineru" ? " MinerU OCR" : "原生 OCR"}`
+                    : "当前使用 PDF 内嵌文本，OCR 补全已关闭"
+              : "PDF 预览已就绪，后台正在解析"}
+          </span>
+          <span>页数：{currentPageCount}</span>
+          <span>
+            {documentData
+              ? translationCacheInfo?.hasCache
+                ? `缓存时间：${translationCacheInfo.translatedAt ?? "未知"}`
+                : "尚未生成翻译缓存"
+              : parseProgress?.status ?? "等待后台解析启动"}
           </span>
         </section>
       ) : null}
@@ -616,11 +702,38 @@ export function App() {
               <select
                 value={draftConfig.useOcrFallback ? "on" : "off"}
                 onChange={(event) =>
-                  setDraftConfig({ ...draftConfig, useOcrFallback: event.target.value === "on" })
+                  setDraftConfig((current) => {
+                    const enabled = event.target.value === "on";
+                    return {
+                      ...current,
+                      useOcrFallback: enabled,
+                      ocrProvider: enabled && current.ocrProvider === "none" ? "native" : current.ocrProvider
+                    };
+                  })
                 }
               >
                 <option value="on">开启</option>
                 <option value="off">关闭</option>
+              </select>
+            </label>
+            <label>
+              <span>OCR Provider</span>
+              <select
+                value={draftConfig.useOcrFallback ? draftConfig.ocrProvider : "none"}
+                onChange={(event) =>
+                  setDraftConfig((current) => {
+                    const provider = event.target.value as OcrProvider;
+                    return {
+                      ...current,
+                      ocrProvider: provider,
+                      useOcrFallback: provider !== "none"
+                    };
+                  })
+                }
+              >
+                <option value="none">关闭 OCR</option>
+                <option value="native">原生 OCR</option>
+                <option value="mineru">MinerU (uv)</option>
               </select>
             </label>
             <label>
@@ -649,7 +762,7 @@ export function App() {
               />
             </label>
           </div>
-          <p className="muted">当前配置完全来自项目根目录的 `.env`。此面板仅用于查看当前值；修改 `.env` 后请重启应用，再点击按钮重新加载显示。</p>
+          <p className="muted">当前配置完全来自项目根目录的 `.env`。可通过 `OCR_PROVIDER=none|native|mineru` 选择 OCR 模块，`mineru` 默认会通过 `uv run` 启动。修改 `.env` 后请重启应用，再点击按钮重新加载显示。</p>
         </section>
       ) : null}
 
@@ -659,7 +772,7 @@ export function App() {
         <section className={`pane pane-original ${paneCollapsed.original ? "collapsed" : ""}`}>
           <PaneHeader
             title="原文"
-            subtitle={documentData ? "原始 PDF 页面" : "先导入 PDF"}
+            subtitle={documentData ? "原始 PDF 页面" : pdfUrl ? "PDF 预览已就绪，后台解析中" : "先导入 PDF"}
             collapsed={paneCollapsed.original}
             onToggle={() => togglePane("original")}
           >
@@ -671,7 +784,7 @@ export function App() {
                 <button
                   className="secondary"
                   onClick={goToNextPage}
-                  disabled={!documentData || activePage === null || activePage >= documentData.pageCount}
+                  disabled={currentPageCount === 0 || activePage === null || activePage >= currentPageCount}
                 >
                   下一页
                 </button>
@@ -681,27 +794,23 @@ export function App() {
 
           {!paneCollapsed.original ? (
             <div className="pane-scroll pane-pdf" ref={originalPaneRef}>
-              {documentData ? (
-                translationView === "page" ? (
+              {pdfUrl ? (
+                !documentData || translationView === "page" ? (
                   <>
                     <div className="pdf-stage pdf-stage-large">
-                      {pdfUrl ? (
-                        <iframe src={`${pdfUrl}#page=${activePage ?? 1}&view=FitH`} title="Original PDF" />
-                      ) : (
-                        <div className="empty-mini">正在准备 PDF 预览...</div>
-                      )}
+                      <iframe src={`${pdfUrl}#page=${activePage ?? 1}&view=FitH`} title="Original PDF" />
                     </div>
                     <div className="thumbnail-strip">
-                      {documentData.pages.map((page) => (
+                      {Array.from({ length: currentPageCount }, (_, index) => index + 1).map((pageNumber) => (
                         <button
-                          key={page.pageNumber}
-                          className={`thumbnail-card ${activePage === page.pageNumber ? "active" : ""}`}
-                          onClick={() => goToPage(page.pageNumber)}
+                          key={pageNumber}
+                          className={`thumbnail-card ${activePage === pageNumber ? "active" : ""}`}
+                          onClick={() => goToPage(pageNumber)}
                         >
-                          {pdfThumbs[page.pageNumber] ? (
-                            <img src={pdfThumbs[page.pageNumber]} alt={`Page ${page.pageNumber}`} />
+                          {pdfThumbs[pageNumber] ? (
+                            <img src={pdfThumbs[pageNumber]} alt={`Page ${pageNumber}`} />
                           ) : (
-                            <span>第 {page.pageNumber} 页</span>
+                            <span>第 {pageNumber} 页</span>
                           )}
                         </button>
                       ))}
@@ -723,7 +832,7 @@ export function App() {
                           </button>
                           <span className="translation-status done">原文</span>
                         </div>
-                        <div className="comparison-card-body">{renderOriginalContent(row.originalText)}</div>
+                        <div className="comparison-card-body markdown-body">{renderOriginalBlock(row.originalText)}</div>
                       </article>
                     ))}
                   </div>
@@ -908,10 +1017,175 @@ function renderOriginalContent(text: string) {
   return text.trim() ? text : "这一页没有提取到原文文本。";
 }
 
+function renderOriginalBlock(text: string) {
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
+      {normalizeLatexMarkdown(renderOriginalContent(text))}
+    </ReactMarkdown>
+  );
+}
+
+function getFileNameFromPath(filePath: string) {
+  const segments = filePath.split(/[\\/]/);
+  return segments[segments.length - 1] || filePath;
+}
+
 function normalizeLatexMarkdown(content: string) {
-  return content
+  const blockEnvironmentPattern =
+    /\\begin\{(equation\*?|align\*?|aligned|gather\*?|multline\*?|cases|matrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix|split)\}([\s\S]*?)\\end\{\1\}/g;
+
+  const normalized = content
+    .replace(/\\\$/g, "$")
+    .replace(/\n[ \t]+\n/g, "\n\n")
+    .replace(/(\\tag\{[^}]+\})(?=[\u4e00-\u9fffA-Z][^\n]*)/g, "$1\n\n")
+    .replace(
+      /(^|\n)[ \t]*(\\[^\n]*\\tag\{[^}]+\}[^\n]*)(?=\n|$)/g,
+      (_match: string, prefix: string, expression: string) => `${prefix}\n\n$$\n${expression.trim()}\n$$\n\n`
+    )
+    .replace(blockEnvironmentPattern, (match: string) => {
+      const trimmed = match.trim();
+      if (trimmed.startsWith("$$") && trimmed.endsWith("$$")) {
+        return trimmed;
+      }
+      return `\n\n$$\n${trimmed}\n$$\n\n`;
+    })
     .replace(/\\\[((?:.|\n)*?)\\\]/g, (_, expression: string) => `\n\n$$\n${expression.trim()}\n$$\n\n`)
     .replace(/\\\(((?:.|\n)*?)\\\)/g, (_match, expression: string) => `$${expression.trim()}$`);
+
+  return normalized
+    .split(/\n{2,}/)
+    .map((block) => normalizeLatexParagraph(block))
+    .join("\n\n");
+}
+
+function normalizeLatexParagraph(block: string) {
+  const trimmed = block.trim();
+  if (!trimmed) {
+    return block;
+  }
+
+  if (shouldKeepBlockAsIs(trimmed)) {
+    return trimmed;
+  }
+
+  const lines = trimmed.split("\n");
+  if (lines.length === 1) {
+    return isLikelyLatexBlock(trimmed) ? `$$\n${trimmed}\n$$` : trimmed;
+  }
+
+  const output: string[] = [];
+  let textBuffer: string[] = [];
+  let mathBuffer: string[] = [];
+
+  const flushText = () => {
+    if (textBuffer.length > 0) {
+      output.push(textBuffer.join("\n").trim());
+      textBuffer = [];
+    }
+  };
+
+  const flushMath = () => {
+    if (mathBuffer.length > 0) {
+      output.push(`$$\n${mathBuffer.join("\n").trim()}\n$$`);
+      mathBuffer = [];
+    }
+  };
+
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+    if (!trimmedLine) {
+      flushMath();
+      flushText();
+      continue;
+    }
+
+    if (isLikelyLatexLine(trimmedLine)) {
+      flushText();
+      mathBuffer.push(trimmedLine);
+      continue;
+    }
+
+    flushMath();
+    textBuffer.push(trimmedLine);
+  }
+
+  flushMath();
+  flushText();
+
+  return output.join("\n\n");
+}
+
+function shouldKeepBlockAsIs(trimmed: string) {
+  return (
+    trimmed.startsWith("$$") ||
+    trimmed.startsWith("```") ||
+    trimmed.startsWith("|") ||
+    trimmed.startsWith(">") ||
+    trimmed.startsWith("#") ||
+    /(?:^|[\s(])\$[^$\n]+(?:\\\$)?\$(?:[,\s]|$)/.test(trimmed) ||
+    /^[-*+] /.test(trimmed) ||
+    /^\d+\. /.test(trimmed)
+  );
+}
+
+function isLikelyLatexBlock(block: string) {
+  const lines = block
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    return false;
+  }
+
+  const latexCommandCount = (block.match(/\\[A-Za-z]+/g) ?? []).length;
+  const hasMathStructure = /[_^{}]|\\\||\||=|\\cdots|\\vdots|\\ddots|\\left|\\right|\\mid|\\ge|\\le|\\neq|\\approx|\\to|\\mapsto|\\tag\{/.test(
+    block
+  );
+  const hasMathCommand = /\\(frac|sum|prod|int|mathcal|mathbf|mathrm|operatorname|text|hat|bar|bm|lambda|theta|alpha|beta|gamma|delta|sigma|omega|Gamma|Delta|Theta|Lambda|Sigma|Omega|nabla|partial|cdot|times|max|min|arg|max|exp|log|sin|cos|tan)/.test(
+    block
+  );
+  const containsSentencePunctuation = /[.!?][\s\n]|[A-Za-z]{4,}.*[.!?]$/.test(block);
+  const averageLineLength = lines.reduce((total, line) => total + line.length, 0) / lines.length;
+
+  if (containsSentencePunctuation && latexCommandCount < 2) {
+    return false;
+  }
+
+  if (lines.length > 1) {
+    return latexCommandCount >= 1 && (hasMathStructure || hasMathCommand);
+  }
+
+  return (
+    latexCommandCount >= 1 &&
+    (hasMathStructure || hasMathCommand) &&
+    (averageLineLength <= 160 || latexCommandCount >= 2)
+  );
+}
+
+function isLikelyLatexLine(line: string) {
+  if (shouldKeepBlockAsIs(line)) {
+    return false;
+  }
+
+  if (/(?:^|[\s(])\$[^$\n]+(?:\\\$)?\$(?:[,\s]|$)/.test(line)) {
+    return false;
+  }
+
+  const latexCommandCount = (line.match(/\\[A-Za-z]+/g) ?? []).length;
+  const hasMathStructure = /[_^{}=]|\\tag\{|\\mid|\\ge|\\le|\\neq|\\approx|\\to|\\cdots|\\vdots|\\ddots|\\left|\\right/.test(
+    line
+  );
+  const hasMathCommand = /\\(frac|sum|prod|int|mathcal|mathbf|mathrm|operatorname|text|hat|bar|bm|lambda|theta|alpha|beta|gamma|delta|sigma|omega|Gamma|Delta|Theta|Lambda|Sigma|Omega|nabla|partial|cdot|times|max|min|arg|max|exp|log|sin|cos|tan)/.test(
+    line
+  );
+  const looksLikeSentence = /[.!?][\s\n]|[A-Za-z]{4,}\s+[A-Za-z]{4,}/.test(line);
+
+  if (looksLikeSentence && latexCommandCount < 2 && !/\\text\{/.test(line)) {
+    return false;
+  }
+
+  return latexCommandCount >= 1 && (hasMathStructure || hasMathCommand);
 }
 
 function renderTranslationBlock(page: TranslationPage | null) {

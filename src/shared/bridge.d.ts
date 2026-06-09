@@ -2,6 +2,7 @@ import type {
   AppConfig,
   ChatRequest,
   LoadedDocument,
+  PdfParseProgress,
   SkillImportResult,
   SkillListResult,
   SkillManifest,
@@ -19,6 +20,7 @@ declare global {
       openPdfDialog: () => Promise<string | null>;
       loadPdf: (filePath: string) => Promise<LoadedDocument>;
       loadPdfBinary: (filePath: string) => Promise<Uint8Array>;
+      onPdfParseProgress: (listener: (progress: PdfParseProgress) => void) => () => void;
       translateDocument: (request: TranslationRequest) => Promise<TranslationResult>;
       getTranslationCacheInfo: (document: LoadedDocument) => Promise<TranslationCacheInfo>;
       loadCachedTranslation: (document: LoadedDocument) => Promise<TranslationResult | null>;

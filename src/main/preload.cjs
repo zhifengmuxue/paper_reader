@@ -6,6 +6,13 @@ const api = {
   openPdfDialog: () => ipcRenderer.invoke("dialog:openPdf"),
   loadPdf: (filePath) => ipcRenderer.invoke("pdf:load", filePath),
   loadPdfBinary: (filePath) => ipcRenderer.invoke("pdf:binary", filePath),
+  onPdfParseProgress: (listener) => {
+    const wrapped = (_event, progress) => listener(progress);
+    ipcRenderer.on("pdf:parseProgress", wrapped);
+    return () => {
+      ipcRenderer.removeListener("pdf:parseProgress", wrapped);
+    };
+  },
   translateDocument: (request) => ipcRenderer.invoke("translation:start", request),
   getTranslationCacheInfo: (document) => ipcRenderer.invoke("translation:cacheInfo", document),
   loadCachedTranslation: (document) => ipcRenderer.invoke("translation:loadCached", document),

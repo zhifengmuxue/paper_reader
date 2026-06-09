@@ -20,6 +20,9 @@ import type {
   ChatMessage,
   ChatRequest,
   LoadedDocument,
+  OcrProvider,
+  PdfParseProgress,
+  PdfParserProvider,
   PdfPage,
   SkillListResult,
   SkillManifest,
@@ -54,6 +57,66 @@ interface TranslationCacheFile extends TranslationResult {
   pageTextFingerprint: string;
 }
 
+interface MineruExtractionResult {
+  pageCount: number;
+  pages: Array<{
+    pageNumber: number;
+    text: string;
+  }>;
+  markdown?: string;
+  backend?: string;
+  error?: string;
+  stdout?: string;
+  stderr?: string;
+}
+
+interface CommandInvocation {
+  command: string;
+  args: string[];
+}
+
+const parseCsvEnv = (value: string | undefined, fallback: string[]): string[] => {
+  const parsed = (value ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return parsed.length > 0 ? parsed : fallback;
+};
+
+const normalizeOcrProvider = (value?: string): OcrProvider => {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "native" || normalized === "vision" || normalized === "macos") {
+    return "native";
+  }
+  if (normalized === "mineru") {
+    return "mineru";
+  }
+  return "none";
+};
+
+const inferDefaultUseOcrFallback = (): boolean => {
+  const fallbackEnv = process.env.USE_OCR_FALLBACK?.trim().toLowerCase();
+  if (fallbackEnv === "false" || fallbackEnv === "0" || fallbackEnv === "off") {
+    return false;
+  }
+
+  if (process.env.OCR_PROVIDER) {
+    return normalizeOcrProvider(process.env.OCR_PROVIDER) !== "none";
+  }
+
+  return true;
+};
+
+const inferDefaultOcrProvider = (): OcrProvider => {
+  if (!inferDefaultUseOcrFallback()) {
+    return "none";
+  }
+  if (process.env.OCR_PROVIDER) {
+    return normalizeOcrProvider(process.env.OCR_PROVIDER);
+  }
+  return "native";
+};
+
 const defaultConfig: AppConfig = {
   apiBaseUrl: process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1",
   apiKey: process.env.OPENAI_API_KEY ?? "",
@@ -61,8 +124,47 @@ const defaultConfig: AppConfig = {
   translationModel: process.env.OPENAI_TRANSLATION_MODEL ?? "gpt-4o-mini",
   temperature: 0.2,
   targetLanguage: "中文",
-  useOcrFallback: true,
+  useOcrFallback: inferDefaultUseOcrFallback(),
+  ocrProvider: inferDefaultOcrProvider(),
   ocrLanguageHint: "en-US,zh-Hans,ja-JP"
+};
+
+const normalizePdfParserProvider = (value?: string): PdfParserProvider =>
+  value?.trim().toLowerCase() === "mineru" ? "mineru" : "pdfjs";
+
+const getPdfParserProvider = (): PdfParserProvider =>
+  normalizePdfParserProvider(process.env.PDF_PARSER_PROVIDER);
+
+const getMineruScriptPath = (): string =>
+  app.isPackaged
+    ? join(process.resourcesPath, "scripts", "extract_with_mineru.py")
+    : join(app.getAppPath(), "scripts", "extract_with_mineru.py");
+
+const getMineruLaunchMode = (): "uv" | "binary" =>
+  process.env.MINERU_LAUNCHER?.trim().toLowerCase() === "binary" ? "binary" : "uv";
+
+const getUvExecutable = (): string => process.env.UV_BIN?.trim() || "uv";
+
+const getMineruUvPackages = (): string[] => parseCsvEnv(process.env.MINERU_UV_WITH, ["mineru", "socksio"]);
+
+type PdfParseProgressReporter = (progress: PdfParseProgress) => void;
+
+const emitPdfParseProgress = (
+  filePath: string,
+  parserProvider: PdfParserProvider,
+  onProgress: PdfParseProgressReporter | undefined,
+  stage: PdfParseProgress["stage"],
+  percent: number,
+  status: string
+): void => {
+  onProgress?.({
+    filePath,
+    fileName: basename(filePath),
+    parserProvider,
+    stage,
+    percent,
+    status
+  });
 };
 
 const createWindow = async (): Promise<void> => {
@@ -118,6 +220,32 @@ const getOcrHelperPath = (): string =>
   app.isPackaged
     ? join(process.resourcesPath, "bin", "ocr-helper")
     : join(app.getAppPath(), "bin", "ocr-helper");
+
+const buildMineruInvocation = (filePath: string): CommandInvocation => {
+  const scriptPath = getMineruScriptPath();
+  if (!existsSync(scriptPath)) {
+    throw new Error(`MinerU helper script not found at ${scriptPath}.`);
+  }
+
+  if (getMineruLaunchMode() === "binary") {
+    return {
+      command: "python3",
+      args: [scriptPath, "--pdf", filePath]
+    };
+  }
+
+  const uvPackages = getMineruUvPackages();
+  const args = ["run"];
+  for (const pkg of uvPackages) {
+    args.push("--with", pkg);
+  }
+  args.push("python", scriptPath, "--pdf", filePath);
+
+  return {
+    command: getUvExecutable(),
+    args
+  };
+};
 
 const readConfig = (): AppConfig => ({ ...defaultConfig });
 
@@ -277,6 +405,27 @@ const shouldRunOcr = (pages: PdfPage[]): boolean => {
   return shortPages > 0 && (fullySparse || shortPages / Math.max(pages.length, 1) >= 0.15);
 };
 
+const runMineruExtraction = async (filePath: string): Promise<MineruExtractionResult> => {
+  const invocation = buildMineruInvocation(filePath);
+  const { stdout, stderr } = await execFileAsync(invocation.command, invocation.args, {
+    maxBuffer: 1024 * 1024 * 128
+  });
+
+  if (stderr?.trim()) {
+    console.warn(stderr.trim());
+  }
+
+  const parsed = JSON.parse(stdout) as MineruExtractionResult;
+  if (parsed.error) {
+    throw new Error(parsed.error);
+  }
+  if (!Array.isArray(parsed.pages) || parsed.pages.length === 0) {
+    throw new Error("MinerU did not return any parsed pages.");
+  }
+
+  return parsed;
+};
+
 const runOcrHelper = async (
   filePath: string,
   config: AppConfig
@@ -299,6 +448,29 @@ const runOcrHelper = async (
   }
 
   return JSON.parse(stdout) as OcrHelperResult;
+};
+
+const runConfiguredOcr = async (
+  filePath: string,
+  config: AppConfig
+): Promise<{ provider: Exclude<OcrProvider, "none">; result: OcrHelperResult }> => {
+  if (config.ocrProvider === "mineru") {
+    const parsed = await runMineruExtraction(filePath);
+    return {
+      provider: "mineru",
+      result: {
+        pages: parsed.pages.map((page) => ({
+          pageNumber: page.pageNumber,
+          text: page.text
+        }))
+      }
+    };
+  }
+
+  return {
+    provider: "native",
+    result: await runOcrHelper(filePath, config)
+  };
 };
 
 const mergeEmbeddedAndOcr = (
@@ -349,33 +521,109 @@ const mergeEmbeddedAndOcr = (
   return { pages, usedOcr };
 };
 
-const extractPdfText = async (filePath: string, config: AppConfig): Promise<LoadedDocument> => {
+const extractPdfTextWithPdfJs = async (
+  filePath: string,
+  config: AppConfig,
+  onProgress?: PdfParseProgressReporter
+): Promise<LoadedDocument> => {
+  emitPdfParseProgress(filePath, "pdfjs", onProgress, "queued", 5, "已进入 PDF 解析队列");
   const data = new Uint8Array(readFileSync(filePath));
   const documentFingerprint = sha256(data);
+  emitPdfParseProgress(filePath, "pdfjs", onProgress, "parsing", 25, "正在提取 PDF 内嵌文本");
   const embedded = await extractEmbeddedPdfText(data);
 
   let pages = embedded.pages;
   let usedOcr = false;
 
-  if (config.useOcrFallback && shouldRunOcr(embedded.pages)) {
+  if (config.ocrProvider !== "none" && config.useOcrFallback && shouldRunOcr(embedded.pages)) {
+    const ocrStatus =
+      config.ocrProvider === "mineru"
+        ? "文本稀疏，正在通过 MinerU OCR 补全文本"
+        : "文本稀疏，正在执行原生 OCR 补全";
+    emitPdfParseProgress(filePath, "pdfjs", onProgress, "parsing", 55, ocrStatus);
     try {
-      const ocrResult = await runOcrHelper(filePath, config);
+      const { result: ocrResult } = await runConfiguredOcr(filePath, config);
       const merged = mergeEmbeddedAndOcr(embedded.pages, ocrResult.pages);
       pages = merged.pages;
       usedOcr = merged.usedOcr;
     } catch (error) {
-      console.error("OCR fallback failed, continuing with embedded text only.", error);
+      console.error(
+        `OCR fallback (${config.ocrProvider}) failed, continuing with embedded text only.`,
+        error
+      );
     }
   }
 
-  return {
+  emitPdfParseProgress(filePath, "pdfjs", onProgress, "finalizing", 90, "正在整理页面文本");
+
+  const loadedDocument: LoadedDocument = {
     filePath,
     fileName: basename(filePath),
     pageCount: embedded.pageCount,
     pages,
     usedOcr,
+    parserProvider: "pdfjs",
     documentFingerprint
   };
+  emitPdfParseProgress(filePath, "pdfjs", onProgress, "done", 100, "PDF 文本解析完成");
+  return loadedDocument;
+};
+
+const extractPdfTextWithMineru = async (
+  filePath: string,
+  _config: AppConfig,
+  onProgress?: PdfParseProgressReporter
+): Promise<LoadedDocument> => {
+  emitPdfParseProgress(filePath, "mineru", onProgress, "queued", 5, "已进入 MinerU 解析队列");
+  const data = new Uint8Array(readFileSync(filePath));
+  const documentFingerprint = sha256(data);
+  emitPdfParseProgress(filePath, "mineru", onProgress, "parsing", 20, "正在启动 MinerU 文档解析");
+  const parsed = await runMineruExtraction(filePath);
+
+  emitPdfParseProgress(filePath, "mineru", onProgress, "finalizing", 88, "MinerU 已完成提取，正在整理页面结果");
+
+  const loadedDocument: LoadedDocument = {
+    filePath,
+    fileName: basename(filePath),
+    pageCount: parsed.pageCount,
+    pages: parsed.pages.map(
+      (page) =>
+        ({
+          pageNumber: page.pageNumber,
+          text: normalizeWhitespace(page.text),
+          extractionMethod: page.text.trim() ? "mineru" : "none"
+        }) satisfies PdfPage
+    ),
+    usedOcr: false,
+    parserProvider: "mineru",
+    documentFingerprint
+  };
+  emitPdfParseProgress(filePath, "mineru", onProgress, "done", 100, "MinerU 文档解析完成");
+  return loadedDocument;
+};
+
+const extractPdfText = async (
+  filePath: string,
+  config: AppConfig,
+  onProgress?: PdfParseProgressReporter
+): Promise<LoadedDocument> => {
+  const provider = getPdfParserProvider();
+  try {
+    if (provider === "mineru") {
+      return extractPdfTextWithMineru(filePath, config, onProgress);
+    }
+    return extractPdfTextWithPdfJs(filePath, config, onProgress);
+  } catch (error) {
+    emitPdfParseProgress(
+      filePath,
+      provider,
+      onProgress,
+      "error",
+      100,
+      error instanceof Error ? `PDF 解析失败：${error.message}` : "PDF 解析失败"
+    );
+    throw error;
+  }
 };
 
 const loadPdfBinary = (filePath: string): Uint8Array => new Uint8Array(readFileSync(filePath));
@@ -526,6 +774,43 @@ const buildTranslationContextWindow = (
   return { previousContext, nextContext };
 };
 
+const normalizeModelMarkdownForRenderer = (content: string): string => {
+  const mathEnvironmentNames =
+    "equation\\*?|align\\*?|aligned|gather\\*?|multline\\*?|cases|matrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix|split";
+  const mathEnvironmentPattern = new RegExp(
+    `\\\\begin\\{(${mathEnvironmentNames})\\}([\\s\\S]*?)\\\\end\\{\\1\\}`,
+    "g"
+  );
+  const assignmentThenEnvironmentPattern = new RegExp(
+    `(^|\\n)[ \\t]*([^\\n]+?=)\\s*\\n+\\s*(\\\\begin\\{(?:${mathEnvironmentNames})\\}[\\s\\S]*?\\\\end\\{(?:${mathEnvironmentNames})\\})`,
+    "g"
+  );
+
+  const normalized = content
+    .replace(/\r\n?/g, "\n")
+    .replace(
+      assignmentThenEnvironmentPattern,
+      (_match: string, prefix: string, leftSide: string, environment: string) =>
+        `${prefix}\n\n$$\n${leftSide.trim()} ${environment.trim()}\n$$\n\n`
+    )
+    .replace(mathEnvironmentPattern, (match: string) => `\n\n$$\n${match.trim()}\n$$\n\n`)
+    .replace(/\\\[((?:.|\n)*?)\\\]/g, (_match, expression: string) => `\n\n$$\n${expression.trim()}\n$$\n\n`)
+    .replace(/\\\(((?:.|\n)*?)\\\)/g, (_match, expression: string) => `$${expression.trim()}$`)
+    .replace(/\n[ \t]+\n/g, "\n\n")
+    .replace(/(\\tag\{[^}]+\})(?=[\u4e00-\u9fffA-Z][^\n]*)/g, "$1\n\n")
+    .replace(
+      /(^|\n)[ \t]*(\\[^\n]*\\tag\{[^}]+\}[^\n]*)(?=\n|$)/g,
+      (_match: string, prefix: string, expression: string) => `${prefix}\n\n$$\n${expression.trim()}\n$$\n\n`
+    );
+
+  return normalized
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/g, ""))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+};
+
 const translateDocument = async (
   request: TranslationRequest,
   config: AppConfig
@@ -620,16 +905,19 @@ const translateDocument = async (
           {
             role: "system",
             content:
-              "You are a professional academic translator and document normalizer. Translate the current page into polished academic prose while structuring the result as clean Markdown that renders well in a reader UI. Preserve equations, symbols, citations, section numbering, technical terms, model names, and references. Keep inline math and display math in valid LaTeX using $...$ and $$...$$. If the source clearly contains headings, bullet points, enumerations, or tabular comparisons, preserve that structure using Markdown headings, lists, and tables. Do not invent new sections or tables when the source does not imply them. Some paragraphs may continue across page breaks. Use the provided previous-page and next-page context only to resolve continuity, but return only the translation of the current page."
+              "You are a professional academic translator and document normalizer. Translate the current page into polished academic prose while structuring the result as clean Markdown that renders well in a reader UI. Preserve equations, symbols, citations, section numbering, technical terms, model names, and references. If the source clearly contains headings, bullet points, enumerations, or tabular comparisons, preserve that structure using Markdown headings, lists, and tables. Do not invent new sections or tables when the source does not imply them. Some paragraphs may continue across page breaks. Use the provided previous-page and next-page context only to resolve continuity, but return only the translation of the current page.\n\nOutput contract:\n1. Return only Markdown body content, with no preface, no translator notes, and no fenced code blocks unless the source itself is code.\n2. Use only these math delimiters: inline math must use $...$ and display math must use $$...$$.\n3. Do not use \\(...\\) or \\[...\\] delimiters.\n4. Any standalone formula, aligned equation, matrix, cases block, or equation with \\tag{...} must be written as a display math block wrapped in $$...$$ on its own lines.\n5. Keep Markdown and math separated by blank lines so the renderer can parse them correctly.\n6. If the source contains Greek letters or short symbols in running text, render them as inline math like $\\alpha$, $\\beta$, and $\\Gamma$."
           },
           {
             role: "user",
             content: [
               `Translate the current academic paper page into ${config.targetLanguage}. Preserve paragraph structure as much as possible and format the result as readable Markdown.`,
               "If a paragraph starts on the previous page or continues to the next page, use the context to keep the translation coherent.",
-              "Preserve formulas in LaTeX, using inline math for short expressions and display math for standalone equations.",
+              "Preserve formulas in LaTeX, using $...$ for inline math and $$...$$ for standalone equations only.",
               "If the page contains comparison data, metric rows, or obvious columnar content, rewrite it as a Markdown table.",
-              "Return only the translated page content. Do not include explanations, translator notes, or fenced code blocks unless the source itself is code.",
+              "If a line contains equation numbering such as \\tag{1} or \\tag{2}, output that entire line as a standalone $$...$$ math block.",
+              "If a line is a sequence of Greek letters or symbols, keep each symbol in inline math, for example: $\\alpha$, $\\beta$, $\\gamma$.",
+              "Do not output raw LaTeX lines outside math delimiters.",
+              "Return only the translated page content. Do not include explanations, translator notes, XML, JSON, or fenced code blocks unless the source itself is code.",
               previousContext ? `\nPrevious page tail context:\n${previousContext}` : "",
               `\nCurrent page text:\n${page.originalText}`,
               nextContext ? `\nNext page head context:\n${nextContext}` : ""
@@ -644,7 +932,7 @@ const translateDocument = async (
       pages[index] = {
         pageNumber: page.pageNumber,
         originalText: page.originalText,
-        translatedText: translation.trim(),
+        translatedText: normalizeModelMarkdownForRenderer(translation),
         status: "done"
       };
     } catch (error) {
@@ -850,7 +1138,11 @@ const buildDocumentContext = (request: ChatRequest): string => {
   return [
     `Document: ${request.document.fileName}`,
     `Pages: ${request.document.pageCount}`,
-    request.document.usedOcr ? "OCR fallback was used for this document." : "Embedded PDF text was used.",
+    request.document.parserProvider === "mineru"
+      ? "MinerU document parsing was used for this document."
+      : request.document.usedOcr
+        ? "OCR fallback was used for this document."
+        : "Embedded PDF text was used.",
     activePage
       ? `Current original page ${activePage.pageNumber} (${activePage.extractionMethod}): ${activePage.text}`
       : "No active page selected.",
@@ -877,7 +1169,7 @@ const chatWithModel = async (
     {
       role: "system",
       content:
-        "You are an academic reading copilot. Be concise, grounded in the provided document context, and explicitly say when the answer depends on missing content."
+        "You are an academic reading copilot. Be concise, grounded in the provided document context, and explicitly say when the answer depends on missing content.\n\nOutput contract:\n1. Return only Markdown body content.\n2. Use only $...$ for inline math and $$...$$ for display math.\n3. Do not output raw LaTeX outside math delimiters.\n4. Any matrix, cases block, aligned equation, or equation with \\tag{...} must be written as a standalone $$...$$ block.\n5. If an expression is of the form `W =` followed by a matrix or other math environment, keep the whole expression in one display-math block.\n6. Keep Markdown paragraphs and math blocks separated by blank lines."
     }
   ];
 
@@ -901,7 +1193,7 @@ const chatWithModel = async (
   );
 
   return {
-    message: answer,
+    message: normalizeModelMarkdownForRenderer(answer),
     usedSkills: selectedSkills
   };
 };
@@ -938,7 +1230,11 @@ ipcMain.handle("dialog:openPdf", async () => {
   return result.filePaths[0];
 });
 
-ipcMain.handle("pdf:load", async (_event, filePath: string) => extractPdfText(filePath, readConfig()));
+ipcMain.handle("pdf:load", async (event, filePath: string) =>
+  extractPdfText(filePath, readConfig(), (progress) => {
+    event.sender.send("pdf:parseProgress", progress);
+  })
+);
 ipcMain.handle("pdf:binary", (_event, filePath: string) => loadPdfBinary(filePath));
 ipcMain.handle("translation:start", async (_event, request: TranslationRequest) =>
   translateDocument(request, readConfig())

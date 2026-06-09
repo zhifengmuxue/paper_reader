@@ -1,7 +1,10 @@
+export type PdfParserProvider = "pdfjs" | "mineru";
+export type OcrProvider = "none" | "native" | "mineru";
+
 export interface PdfPage {
   pageNumber: number;
   text: string;
-  extractionMethod: "embedded-text" | "ocr" | "none";
+  extractionMethod: "embedded-text" | "ocr" | "mineru" | "none";
 }
 
 export interface LoadedDocument {
@@ -10,7 +13,17 @@ export interface LoadedDocument {
   pageCount: number;
   pages: PdfPage[];
   usedOcr: boolean;
+  parserProvider: PdfParserProvider;
   documentFingerprint: string;
+}
+
+export interface PdfParseProgress {
+  filePath: string;
+  fileName: string;
+  parserProvider: PdfParserProvider;
+  stage: "queued" | "preview-ready" | "parsing" | "finalizing" | "done" | "error";
+  percent: number;
+  status: string;
 }
 
 export interface TranslationPage {
@@ -51,6 +64,7 @@ export interface AppConfig {
   temperature: number;
   targetLanguage: string;
   useOcrFallback: boolean;
+  ocrProvider: OcrProvider;
   ocrLanguageHint: string;
 }
 
